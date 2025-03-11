@@ -1,5 +1,3 @@
-[[Wang_et+al_CyclesganCycleconsistentSemanticspreservingGenerativeAdversarial_2024]]
-
 # [CycleSGAN: A cycle-consistent and semantics-preserving generative adversarial network for unpaired MR-to-CT image synthesis](https://doi.org/10.1016/j.compmedimag.2024.102431)
 
 ## [[Runze Wang]]; [[Alexander F. Heimann]]; [[Moritz Tannast]] et al.
