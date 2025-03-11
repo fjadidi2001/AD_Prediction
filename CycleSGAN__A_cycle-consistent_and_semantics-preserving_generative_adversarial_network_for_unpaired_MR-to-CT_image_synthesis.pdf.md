@@ -79,9 +79,6 @@ The study concluded that CycleSGAN is a novel and effective approach for unpaire
 ## Counterpoint to earlier claims
 - The joint distribution is represented as a channel-wise concatenation of images and their corresponding multi-label annotation masks where each voxel has a distinct label. ==Unlike the conventional CycleGAN== ([^Zhu_et+al_2017_a]), which is restricted to the two-player framework, CycleSGAN adopts a three-player game in each domain.
 
-## Contributions
-- <mark class="claim">We developed and validated a new unpaired MR-to-CT image synthesis method</mark>. Our method featured a novel and generic way to incorporate semantic information into CycleGAN by designing a pair of three-player game. <mark class="claim">Our approach outperformed multiple state-of-theart methods and demonstrated the value of the three-player game in ensuring both realistic image synthesis and semantic structure preservation, <mark class="fact">which were of importance for down-stream tasks</mark> such as treatment planning and attenuation correction</mark>.
-
 ## Limitations
 - The limitations of the study include the requirement of label supervisions to train the model, although the model can take an MR image as input to generate a synthetic CT image without the need of annotation labels at testing stage.
 - The study acknowledges that the evaluation was only conducted on hip MR-CT datasets, and further investigation is required to determine whether similar performance can be obtained on datasets of different anatomical regions or acquired with different imaging protocols. The study also acknowledges that CycleSGAN requires label supervisions to train a model for unpaired MR-to-CT image synthesis.
