@@ -1,0 +1,1091 @@
+"""
+Enhanced Linguistic Features Service - Microservice for extracting linguistic features and BERT embeddings
+Handles text analysis, BERT preprocessing, and integration with transcription pipeline
+"""
+import os
+import re
+import json
+import numpy as np
+import torch
+from typing import Dict, List, Optional, Any, Tuple, Union
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
+import logging
+from collections import Counter
+import string
+from pathlib import Path
+import pickle
+from datetime import datetime
+
+# BERT imports with error handling
+try:
+    from transformers import BertTokenizer, BertModel, AutoTokenizer, AutoModel
+    import torch.nn.functional as F
+    BERT_AVAILABLE = True
+    print("✓ Transformers library available")
+except ImportError as e:
+    BERT_AVAILABLE = False
+    print(f"⚠ Transformers not available: {e}")
+
+# Try to import your existing modules
+try:
+    from config import MODEL_CONFIG, SYSTEM_CONFIG
+    from utils import (setup_logging, monitor_memory_usage, cleanup_memory,
+                       safe_save_pickle, ProcessingTimer, batch_generator)
+    from transcription_service import TranscriptionResult
+    CUSTOM_MODULES_AVAILABLE = True
+except ImportError as e:
+    CUSTOM_MODULES_AVAILABLE = False
+    print(f"⚠ Custom modules not available: {e}")
+    
+    # Fallback implementations
+    class ProcessingTimer:
+        def __init__(self):
+            self.start_time = None
+            self.elapsed = 0
+        
+        def __enter__(self):
+            import time
+            self.start_time = time.time()
+            return self
+        
+        def __exit__(self, *args):
+            import time
+            self.elapsed = time.time() - self.start_time
+    
+    def setup_logging():
+        logging.basicConfig(level=logging.INFO)
+        return logging.getLogger(__name__)
+    
+    def cleanup_memory():
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    def batch_generator(items, batch_size):
+        for i in range(0, len(items), batch_size):
+            yield items[i:i + batch_size]
+    
+    # Default config
+    class MODEL_CONFIG:
+        bert_model = "bert-base-uncased"
+        max_sequence_length = 512
+        batch_size = 32
+    
+    class SYSTEM_CONFIG:
+        output_dir = "output"
+
+@dataclass
+class LinguisticFeatures:
+    """Enhanced data class for linguistic features"""
+    # Metadata
+    source_file: str = ""
+    category: str = ""
+    processing_timestamp: str = ""
+    
+    # Basic text statistics
+    raw_text: str = ""
+    word_count: int = 0
+    sentence_count: int = 0
+    char_count: int = 0
+    avg_word_length: float = 0.0
+    avg_sentence_length: float = 0.0
+    
+    # Vocabulary features
+    unique_words: int = 0
+    lexical_diversity: float = 0.0  # TTR - Type Token Ratio
+    function_words_ratio: float = 0.0
+    content_words_ratio: float = 0.0
+    
+    # Advanced vocabulary metrics
+    hapax_legomena_ratio: float = 0.0  # Words appearing only once
+    dis_legomena_ratio: float = 0.0    # Words appearing exactly twice
+    vocab_sophistication: float = 0.0   # Ratio of complex words
+    
+    # Syntactic features
+    noun_ratio: float = 0.0
+    verb_ratio: float = 0.0
+    adjective_ratio: float = 0.0
+    pronoun_ratio: float = 0.0
+    determiner_ratio: float = 0.0
+    
+    # Semantic complexity
+    syllable_count: int = 0
+    avg_syllables_per_word: float = 0.0
+    complex_words_ratio: float = 0.0  # Words with 3+ syllables
+    polysyllabic_words_ratio: float = 0.0  # Words with 4+ syllables
+    
+    # Readability metrics
+    flesch_reading_ease: float = 0.0
+    flesch_kincaid_grade: float = 0.0
+    
+    # Discourse features
+    repetition_ratio: float = 0.0
+    pause_indicators: int = 0
+    filler_words: int = 0
+    disfluency_ratio: float = 0.0
+    
+    # Semantic coherence (simple metrics)
+    topic_word_ratio: float = 0.0
+    semantic_density: float = 0.0
+    
+    # BERT features - Enhanced
+    bert_tokens: List[str] = None
+    bert_input_ids: List[int] = None
+    bert_attention_mask: List[int] = None
+    bert_token_count: int = 0
+    bert_oov_count: int = 0  # Out-of-vocabulary tokens
+    
+    # BERT embeddings - Multiple representations
+    bert_cls_embedding: Optional[np.ndarray] = None      # [CLS] token
+    bert_mean_embedding: Optional[np.ndarray] = None     # Mean of all tokens
+    bert_max_embedding: Optional[np.ndarray] = None      # Max pooling
+    bert_sentence_embedding: Optional[np.ndarray] = None # Sentence-level
+    
+    # Processing metadata
+    processing_success: bool = False
+    error_message: Optional[str] = None
+    processing_time: float = 0.0
+    
+    def __post_init__(self):
+        if self.bert_tokens is None:
+            self.bert_tokens = []
+        if self.bert_input_ids is None:
+            self.bert_input_ids = []
+        if self.bert_attention_mask is None:
+            self.bert_attention_mask = []
+
+class EnhancedLinguisticFeaturesService:
+    """Enhanced service for extracting linguistic features from transcripts"""
+
+    def __init__(self, 
+                 bert_model: str = "bert-base-uncased",
+                 max_length: int = 512,
+                 device: str = "auto",
+                 logger: Optional[logging.Logger] = None):
+        
+        self.logger = logger or setup_logging()
+        self.max_length = max_length
+        
+        # Device setup
+        if device == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(device)
+        
+        self.logger.info(f"Using device: {self.device}")
+        
+        # Initialize BERT
+        self.bert_model_name = bert_model
+        self.bert_tokenizer = None
+        self.bert_model = None
+        
+        # Enhanced word lists
+        self.function_words = self._load_function_words()
+        self.filler_words = self._load_filler_words()
+        self.pause_indicators = {'[pause]', '[silence]', '...', '--', '[inaudible]', '[unclear]'}
+        
+        # Academic/sophisticated word list (sample)
+        self.sophisticated_words = self._load_sophisticated_words()
+        
+        self._initialize_bert()
+
+    def _initialize_bert(self):
+        """Initialize BERT model for embeddings"""
+        if not BERT_AVAILABLE:
+            self.logger.warning("Transformers not available - BERT features will be limited")
+            return
+
+        try:
+            self.logger.info(f"Loading BERT model: {self.bert_model_name}")
+            
+            # Load tokenizer and model
+            self.bert_tokenizer = BertTokenizer.from_pretrained(self.bert_model_name)
+            self.bert_model = BertModel.from_pretrained(self.bert_model_name)
+            
+            # Move to device and set to eval mode
+            self.bert_model.to(self.device)
+            self.bert_model.eval()
+            
+            self.logger.info(f"✓ BERT model loaded successfully on {self.device}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load BERT model: {e}")
+            self.bert_tokenizer = None
+            self.bert_model = None
+
+    def _load_function_words(self) -> set:
+        """Load comprehensive function words list"""
+        function_words = {
+            # Articles
+            'a', 'an', 'the',
+            # Prepositions
+            'in', 'on', 'at', 'by', 'to', 'from', 'of', 'with', 'about', 'into', 'through', 
+            'during', 'before', 'after', 'above', 'below', 'over', 'under', 'between', 
+            'among', 'against', 'beside', 'beneath', 'beyond', 'across', 'within', 'without',
+            # Conjunctions
+            'and', 'or', 'but', 'nor', 'for', 'yet', 'so', 'because', 'since', 'although', 
+            'while', 'if', 'unless', 'until', 'when', 'where', 'how', 'why', 'whether',
+            # Pronouns
+            'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them',
+            'my', 'your', 'his', 'her', 'its', 'our', 'their', 'mine', 'yours', 'ours', 
+            'theirs', 'this', 'that', 'these', 'those', 'what', 'which', 'who', 'whom', 'whose',
+            # Auxiliary verbs
+            'am', 'is', 'are', 'was', 'were', 'be', 'being', 'been',
+            'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing',
+            'will', 'would', 'shall', 'should', 'may', 'might', 'can', 'could', 'must',
+            # Determiners
+            'all', 'any', 'both', 'each', 'every', 'few', 'many', 'most', 'much', 'no', 
+            'several', 'some', 'such',
+            # Others
+            'not', 'yes', 'there', 'here', 'then', 'now', 'just', 'only', 'also', 'too',
+            'very', 'quite', 'rather', 'more', 'most', 'less', 'least'
+        }
+        return function_words
+
+    def _load_filler_words(self) -> set:
+        """Load comprehensive filler words and phrases"""
+        return {
+            'um', 'uh', 'er', 'ah', 'hmm', 'mm', 'eh', 'oh',
+            'well', 'like', 'you know', 'sort of', 'kind of', 'i mean',
+            'actually', 'basically', 'literally', 'totally', 'really',
+            'so', 'anyway', 'ok', 'okay', 'right', 'yeah', 'yes', 'sure'
+        }
+
+    def _load_sophisticated_words(self) -> set:
+        """Load academic/sophisticated vocabulary (sample)"""
+        return {
+            'analyze', 'synthesis', 'hypothesis', 'methodology', 'paradigm',
+            'phenomenon', 'comprehensive', 'substantial', 'significant', 'fundamental',
+            'consequently', 'furthermore', 'nevertheless', 'therefore', 'however',
+            'demonstrate', 'illustrate', 'emphasize', 'facilitate', 'implement'
+        }
+
+    def _count_syllables(self, word: str) -> int:
+        """Enhanced syllable counting algorithm"""
+        word = word.lower().strip(".,!?;:\"'")
+        if not word or len(word) <= 2:
+            return 1
+
+        # Special cases
+        if word.endswith(('ed', 'es')):
+            if word.endswith('ed') and len(word) > 3:
+                if word[-3] not in 'aeiou':
+                    word = word[:-2]
+        
+        # Remove silent 'e' at the end (but not 'le')
+        if word.endswith('e') and not word.endswith('le'):
+            word = word[:-1]
+
+        # Count vowel groups
+        vowels = "aeiouy"
+        syllable_count = 0
+        prev_was_vowel = False
+
+        for i, char in enumerate(word):
+            is_vowel = char in vowels
+            if is_vowel and not prev_was_vowel:
+                syllable_count += 1
+            prev_was_vowel = is_vowel
+
+        # Special patterns
+        if word.endswith('le') and len(word) > 2 and word[-3] not in vowels:
+            syllable_count += 1
+
+        return max(1, syllable_count)
+
+    def _calculate_readability(self, features_dict: dict) -> Tuple[float, float]:
+        """Calculate Flesch Reading Ease and Flesch-Kincaid Grade Level"""
+        words = features_dict['word_count']
+        sentences = features_dict['sentence_count']
+        syllables = features_dict['syllable_count']
+        
+        if sentences == 0 or words == 0:
+            return 0.0, 0.0
+        
+        # Flesch Reading Ease
+        fre = 206.835 - (1.015 * (words / sentences)) - (84.6 * (syllables / words))
+        
+        # Flesch-Kincaid Grade Level
+        fkgl = (0.39 * (words / sentences)) + (11.8 * (syllables / words)) - 15.59
+        
+        return max(0, fre), max(0, fkgl)
+
+    def _extract_enhanced_bert_features(self, text: str) -> Dict[str, Any]:
+        """Extract comprehensive BERT features and embeddings"""
+        if not BERT_AVAILABLE or not self.bert_tokenizer or not self.bert_model:
+            return {
+                'bert_tokens': [],
+                'bert_input_ids': [],
+                'bert_attention_mask': [],
+                'bert_token_count': 0,
+                'bert_oov_count': 0,
+                'bert_cls_embedding': None,
+                'bert_mean_embedding': None,
+                'bert_max_embedding': None,
+                'bert_sentence_embedding': None
+            }
+
+        try:
+            # Tokenize text
+            encoded = self.bert_tokenizer.encode_plus(
+                text,
+                add_special_tokens=True,
+                max_length=self.max_length,
+                padding='max_length',
+                truncation=True,
+                return_attention_mask=True,
+                return_tensors='pt'
+            )
+
+            # Move to device
+            input_ids = encoded['input_ids'].to(self.device)
+            attention_mask = encoded['attention_mask'].to(self.device)
+
+            # Get tokens for analysis
+            tokens = self.bert_tokenizer.convert_ids_to_tokens(input_ids[0])
+            
+            # Count OOV tokens
+            oov_count = sum(1 for token in tokens if token == '[UNK]')
+            actual_tokens = sum(attention_mask[0]).item()  # Exclude padding
+
+            # Get embeddings
+            with torch.no_grad():
+                outputs = self.bert_model(input_ids=input_ids, attention_mask=attention_mask)
+                hidden_states = outputs.last_hidden_state[0]  # [seq_len, hidden_size]
+                
+                # Extract different embedding representations
+                cls_embedding = hidden_states[0].cpu().numpy()  # [CLS] token
+                
+                # Mean pooling (excluding padding and special tokens)
+                mask = attention_mask[0].bool()
+                token_embeddings = hidden_states[mask]
+                if len(token_embeddings) > 2:  # Exclude [CLS] and [SEP]
+                    mean_embedding = token_embeddings[1:-1].mean(dim=0).cpu().numpy()
+                    max_embedding = token_embeddings[1:-1].max(dim=0)[0].cpu().numpy()
+                else:
+                    mean_embedding = cls_embedding
+                    max_embedding = cls_embedding
+                
+                # Sentence-level embedding (weighted average)
+                weights = attention_mask[0].float()
+                sentence_embedding = (hidden_states * weights.unsqueeze(-1)).sum(dim=0) / weights.sum()
+                sentence_embedding = sentence_embedding.cpu().numpy()
+
+            return {
+                'bert_tokens': tokens,
+                'bert_input_ids': input_ids[0].cpu().tolist(),
+                'bert_attention_mask': attention_mask[0].cpu().tolist(),
+                'bert_token_count': actual_tokens,
+                'bert_oov_count': oov_count,
+                'bert_cls_embedding': cls_embedding,
+                'bert_mean_embedding': mean_embedding,
+                'bert_max_embedding': max_embedding,
+                'bert_sentence_embedding': sentence_embedding
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error extracting BERT features: {e}")
+            return {
+                'bert_tokens': [],
+                'bert_input_ids': [],
+                'bert_attention_mask': [],
+                'bert_token_count': 0,
+                'bert_oov_count': 0,
+                'bert_cls_embedding': None,
+                'bert_mean_embedding': None,
+                'bert_max_embedding': None,
+                'bert_sentence_embedding': None
+            }
+
+    def _extract_enhanced_features(self, text: str) -> Dict[str, Any]:
+        """Extract all linguistic features with enhanced metrics"""
+        if not text or not text.strip():
+            return self._get_empty_features_dict()
+
+        # Clean and prepare text
+        clean_text = text.strip()
+        words = clean_text.split()
+        clean_words = [word.strip(string.punctuation).lower() for word in words if word.strip(string.punctuation)]
+
+        # Basic statistics
+        word_count = len(clean_words) if clean_words else 0
+        sentences = re.split(r'[.!?]+', clean_text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        sentence_count = len(sentences)
+        char_count = len(clean_text.replace(' ', ''))
+
+        # Handle empty text
+        if word_count == 0:
+            return self._get_empty_features_dict()
+
+        # Vocabulary analysis
+        word_freq = Counter(clean_words)
+        unique_words = len(word_freq)
+        lexical_diversity = unique_words / word_count
+        
+        # Hapax and dis legomena
+        hapax_legomena = sum(1 for freq in word_freq.values() if freq == 1)
+        dis_legomena = sum(1 for freq in word_freq.values() if freq == 2)
+        hapax_ratio = hapax_legomena / word_count
+        dis_ratio = dis_legomena / word_count
+
+        # Function vs content words
+        function_word_count = sum(1 for word in clean_words if word in self.function_words)
+        content_word_count = word_count - function_word_count
+        function_ratio = function_word_count / word_count
+        content_ratio = content_word_count / word_count
+
+        # Vocabulary sophistication
+        sophisticated_count = sum(1 for word in clean_words if word in self.sophisticated_words)
+        vocab_sophistication = sophisticated_count / word_count
+
+        # Syllable analysis
+        syllable_counts = [self._count_syllables(word) for word in clean_words]
+        total_syllables = sum(syllable_counts)
+        avg_syllables = total_syllables / word_count
+        complex_words = sum(1 for count in syllable_counts if count >= 3)
+        polysyllabic_words = sum(1 for count in syllable_counts if count >= 4)
+        complex_ratio = complex_words / word_count
+        polysyllabic_ratio = polysyllabic_words / word_count
+
+        # Readability metrics
+        flesch_ease, flesch_grade = self._calculate_readability({
+            'word_count': word_count,
+            'sentence_count': sentence_count,
+            'syllable_count': total_syllables
+        })
+
+        # Discourse features
+        pause_count = sum(text.lower().count(indicator) for indicator in self.pause_indicators)
+        
+        # Filler words (handle multi-word fillers)
+        text_lower = text.lower()
+        filler_count = 0
+        for filler in self.filler_words:
+            if ' ' in filler:
+                filler_count += text_lower.count(filler)
+            else:
+                filler_count += clean_words.count(filler)
+
+        # Repetition and disfluency
+        repeated_words = sum(max(0, count - 1) for count in word_freq.values())
+        repetition_ratio = repeated_words / word_count
+        disfluency_ratio = (filler_count + pause_count) / word_count
+
+        # Simple POS analysis (heuristic-based)
+        pos_features = self._simple_pos_analysis(clean_words)
+
+        # Semantic density (content words per sentence)
+        semantic_density = content_word_count / sentence_count if sentence_count > 0 else 0
+
+        # BERT features
+        bert_features = self._extract_enhanced_bert_features(text)
+
+        return {
+            # Basic stats
+            'word_count': word_count,
+            'sentence_count': sentence_count,
+            'char_count': char_count,
+            'avg_word_length': np.mean([len(word) for word in clean_words]),
+            'avg_sentence_length': word_count / sentence_count if sentence_count > 0 else 0,
+            
+            # Vocabulary
+            'unique_words': unique_words,
+            'lexical_diversity': lexical_diversity,
+            'function_words_ratio': function_ratio,
+            'content_words_ratio': content_ratio,
+            'hapax_legomena_ratio': hapax_ratio,
+            'dis_legomena_ratio': dis_ratio,
+            'vocab_sophistication': vocab_sophistication,
+            
+            # Syntactic
+            **pos_features,
+            
+            # Semantic complexity
+            'syllable_count': total_syllables,
+            'avg_syllables_per_word': avg_syllables,
+            'complex_words_ratio': complex_ratio,
+            'polysyllabic_words_ratio': polysyllabic_ratio,
+            
+            # Readability
+            'flesch_reading_ease': flesch_ease,
+            'flesch_kincaid_grade': flesch_grade,
+            
+            # Discourse
+            'repetition_ratio': repetition_ratio,
+            'pause_indicators': pause_count,
+            'filler_words': filler_count,
+            'disfluency_ratio': disfluency_ratio,
+            'semantic_density': semantic_density,
+            'topic_word_ratio': content_ratio,  # Simplified
+            
+            # BERT features
+            **bert_features
+        }
+
+    def _simple_pos_analysis(self, words: List[str]) -> Dict[str, float]:
+        """Simple heuristic-based POS analysis"""
+        if not words:
+            return {
+                'noun_ratio': 0.0, 'verb_ratio': 0.0, 'adjective_ratio': 0.0,
+                'pronoun_ratio': 0.0, 'determiner_ratio': 0.0
+            }
+
+        noun_count = verb_count = adj_count = pron_count = det_count = 0
+        
+        # Common patterns
+        verb_endings = {'ed', 'ing', 'es', 's'}
+        adj_endings = {'ly', 'ful', 'less', 'ous', 'ive', 'able', 'ible', 'al', 'ic'}
+        common_verbs = {'is', 'are', 'was', 'were', 'have', 'has', 'had', 'do', 'does', 'did',
+                       'can', 'could', 'will', 'would', 'shall', 'should', 'may', 'might', 'must'}
+        pronouns = {'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them'}
+        determiners = {'the', 'a', 'an', 'this', 'that', 'these', 'those', 'my', 'your', 'his', 'her', 'its', 'our', 'their'}
+
+        for word in words:
+            if word in pronouns:
+                pron_count += 1
+            elif word in determiners:
+                det_count += 1
+            elif word in common_verbs or any(word.endswith(end) for end in verb_endings if len(word) > 3):
+                verb_count += 1
+            elif any(word.endswith(end) for end in adj_endings):
+                adj_count += 1
+            else:
+                noun_count += 1
+
+        total = len(words)
+        return {
+            'noun_ratio': noun_count / total,
+            'verb_ratio': verb_count / total,
+            'adjective_ratio': adj_count / total,
+            'pronoun_ratio': pron_count / total,
+            'determiner_ratio': det_count / total
+        }
+
+    def _get_empty_features_dict(self) -> Dict[str, Any]:
+        """Get empty features dictionary"""
+        return {
+            'word_count': 0, 'sentence_count': 0, 'char_count': 0,
+            'avg_word_length': 0.0, 'avg_sentence_length': 0.0,
+            'unique_words': 0, 'lexical_diversity': 0.0,
+            'function_words_ratio': 0.0, 'content_words_ratio': 0.0,
+            'hapax_legomena_ratio': 0.0, 'dis_legomena_ratio': 0.0,
+            'vocab_sophistication': 0.0,
+            'noun_ratio': 0.0, 'verb_ratio': 0.0, 'adjective_ratio': 0.0,
+            'pronoun_ratio': 0.0, 'determiner_ratio': 0.0,
+            'syllable_count': 0, 'avg_syllables_per_word': 0.0,
+            'complex_words_ratio': 0.0, 'polysyllabic_words_ratio': 0.0,
+            'flesch_reading_ease': 0.0, 'flesch_kincaid_grade': 0.0,
+            'repetition_ratio': 0.0, 'pause_indicators': 0,
+            'filler_words': 0, 'disfluency_ratio': 0.0,
+            'semantic_density': 0.0, 'topic_word_ratio': 0.0,
+            'bert_tokens': [], 'bert_input_ids': [], 'bert_attention_mask': [],
+            'bert_token_count': 0, 'bert_oov_count': 0,
+            'bert_cls_embedding': None, 'bert_mean_embedding': None,
+            'bert_max_embedding': None, 'bert_sentence_embedding': None
+        }
+
+    def extract_features(self, text: str, source_file: str = "", category: str = "") -> LinguisticFeatures:
+        """Extract all linguistic features from text"""
+        try:
+            start_time = datetime.now()
+            
+            if not text or not text.strip():
+                self.logger.warning("Empty text provided for feature extraction")
+                return self._create_empty_features(text, "Empty text provided", source_file, category)
+
+            self.logger.info(f"Extracting linguistic features from text ({len(text)} characters)")
+
+            with ProcessingTimer() as timer:
+                # Extract all features
+                features_dict = self._extract_enhanced_features(text)
+                
+                # Create LinguisticFeatures object
+                features = LinguisticFeatures(
+                    source_file=source_file,
+                    category=category,
+                    processing_timestamp=start_time.isoformat(),
+                    raw_text=text,
+                    processing_success=True,
+                    processing_time=timer.elapsed,
+                    **features_dict
+                )
+
+            self.logger.info(f"✓ Feature extraction completed in {timer.elapsed:.2f}s")
+            return features
+
+        except Exception as e:
+            self.logger.error(f"Error extracting linguistic features: {e}")
+            return self._create_empty_features(text, str(e), source_file, category)
+
+    def _create_empty_features(self, text: str, error_message: str, 
+                             source_file: str = "", category: str = "") -> LinguisticFeatures:
+        """Create empty features object for error cases"""
+        empty_dict = self._get_empty_features_dict()
+        return LinguisticFeatures(
+            source_file=source_file,
+            category=category,
+            processing_timestamp=datetime.now().isoformat(),
+            raw_text=text or "",
+            processing_success=False,
+            error_message=error_message,
+            processing_time=0.0,
+            **empty_dict
+        )
+
+    def process_transcription_files(self, results_file: str, output_dir: str = None) -> Dict[str, Any]:
+        """Process transcription results and extract linguistic features"""
+        try:
+            if output_dir is None:
+                output_dir = os.path.dirname(results_file)
+            
+            # Load transcription results
+            with open(results_file, 'r', encoding='utf-8') as f:
+                transcription_data = json.load(f)
+            
+            self.logger.info(f"Processing transcriptions from {results_file}")
+            
+            # Process each category
+            all_features = {}
+            processing_stats = {
+                'total_processed': 0,
+                'successful': 0,
+                'failed': 0,
+                'categories': {}
+            }
+            
+            for category, files_data in transcription_data.items():
+                self.logger.info(f"Processing category: {category}")
+                category_features = []
+                
+                for file_data in files_data:
+                    if file_data.get('success', False) and file_data.get('text'):
+                        # Extract features
+                        features = self.extract_features(
+                            text=file_data['text'],
+                            source_file=file_data.get('filename', ''),
+                            category=category
+                        )
+                        
+                        # Add transcription metadata
+                        if hasattr(features, 'confidence'):
+                            features.confidence = file_data.get('confidence', 0.0)
+                        
+                        category_features.append(features)
+                        
+                        if features.processing_success:
+                            processing_stats['successful'] += 1
+                        else:
+                            processing_stats['failed'] += 1
+                        
+                        processing_stats['total_processed'] += 1
+                    
+                all_features[category] = category_features
+                processing_stats['categories'][category] = {
+                    'total': len(category_features),
+                    'successful': sum(1 for f in category_features if f.processing_success),
+                    'failed': sum(1 for f in category_features if not f.processing_success)
+                }
+            
+            # Save results
+            self._save_linguistic_features(all_features, output_dir, processing_stats)
+            
+            self.logger.info(f"✓ Processed {processing_stats['total_processed']} files")
+            return {
+                'features': all_features,
+                'stats': processing_stats,
+                'output_dir': output_dir
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error processing transcription files: {e}")
+            return {'error': str(e)}
+
+    def _save_linguistic_features(self, features_data: Dict[str, List[LinguisticFeatures]], 
+                                output_dir: str, stats: Dict[str, Any]):
+        """Save linguistic features to various formats"""
+        try:
+            # Create output directory
+            features_dir = os.path.join(output_dir, "linguistic_features")
+            os.makedirs(features_dir, exist_ok=True)
+            
+            # Save complete features as pickle
+            features_file = os.path.join(features_dir, "linguistic_features.pkl")
+            with open(features_file, 'wb') as f:
+                pickle.dump(features_data, f)
+            
+            # Save features as JSON (excluding numpy arrays)
+            json_data = {}
+            for category, features_list in features_data.items():
+                json_data[category] = []
+                for features in features_list:
+                    feature_dict = asdict(features)
+                    # Remove numpy arrays for JSON serialization
+                    for key in ['bert_cls_embedding', 'bert_mean_embedding', 
+                               'bert_max_embedding', 'bert_sentence_embedding']:
+                        if feature_dict[key] is not None:
+                            feature_dict[key] = f"<numpy_array_shape_{np.array(feature_dict[key]).shape}>"
+                        else:
+                            feature_dict[key] = None
+                    json_data[category].append(feature_dict)
+            
+            json_file = os.path.join(features_dir, "linguistic_features.json")
+            with open(json_file, 'w', encoding='utf-8') as f:
+                json.dump(json_data, f, indent=2, ensure_ascii=False)
+            
+            # Save BERT embeddings separately
+            self._save_bert_embeddings(features_data, features_dir)
+            
+            # Save summary statistics
+            self._save_feature_summary(features_data, features_dir, stats)
+            
+            # Save feature analysis
+            self._save_feature_analysis(features_data, features_dir)
+            
+            self.logger.info(f"✓ Linguistic features saved to {features_dir}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving linguistic features: {e}")
+
+    def _save_bert_embeddings(self, features_data: Dict[str, List[LinguisticFeatures]], output_dir: str):
+        """Save BERT embeddings separately as numpy arrays"""
+        try:
+            bert_dir = os.path.join(output_dir, "bert_embeddings")
+            os.makedirs(bert_dir, exist_ok=True)
+            
+            for category, features_list in features_data.items():
+                category_embeddings = {
+                    'cls_embeddings': [],
+                    'mean_embeddings': [],
+                    'max_embeddings': [],
+                    'sentence_embeddings': [],
+                    'filenames': [],
+                    'success_flags': []
+                }
+                
+                for features in features_list:
+                    category_embeddings['filenames'].append(features.source_file)
+                    category_embeddings['success_flags'].append(features.processing_success)
+                    
+                    if features.bert_cls_embedding is not None:
+                        category_embeddings['cls_embeddings'].append(features.bert_cls_embedding)
+                        category_embeddings['mean_embeddings'].append(features.bert_mean_embedding)
+                        category_embeddings['max_embeddings'].append(features.bert_max_embedding)
+                        category_embeddings['sentence_embeddings'].append(features.bert_sentence_embedding)
+                    else:
+                        # Add None placeholders
+                        for key in ['cls_embeddings', 'mean_embeddings', 'max_embeddings', 'sentence_embeddings']:
+                            category_embeddings[key].append(None)
+                
+                # Save embeddings
+                embeddings_file = os.path.join(bert_dir, f"{category}_embeddings.npz")
+                
+                # Filter out None values for numpy saving
+                valid_indices = [i for i, emb in enumerate(category_embeddings['cls_embeddings']) if emb is not None]
+                
+                if valid_indices:
+                    np.savez_compressed(
+                        embeddings_file,
+                        cls_embeddings=np.array([category_embeddings['cls_embeddings'][i] for i in valid_indices]),
+                        mean_embeddings=np.array([category_embeddings['mean_embeddings'][i] for i in valid_indices]),
+                        max_embeddings=np.array([category_embeddings['max_embeddings'][i] for i in valid_indices]),
+                        sentence_embeddings=np.array([category_embeddings['sentence_embeddings'][i] for i in valid_indices]),
+                        filenames=np.array([category_embeddings['filenames'][i] for i in valid_indices]),
+                        valid_indices=np.array(valid_indices)
+                    )
+                    
+                    self.logger.info(f"✓ Saved {len(valid_indices)} BERT embeddings for category: {category}")
+                
+        except Exception as e:
+            self.logger.error(f"Error saving BERT embeddings: {e}")
+
+    def _save_feature_summary(self, features_data: Dict[str, List[LinguisticFeatures]], 
+                            output_dir: str, stats: Dict[str, Any]):
+        """Save feature summary and statistics"""
+        try:
+            summary_file = os.path.join(output_dir, "feature_summary.txt")
+            
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                f.write("LINGUISTIC FEATURES ANALYSIS SUMMARY\n")
+                f.write("=" * 50 + "\n\n")
+                
+                # Overall statistics
+                f.write(f"Processing Statistics:\n")
+                f.write(f"  Total files processed: {stats['total_processed']}\n")
+                f.write(f"  Successful extractions: {stats['successful']}\n")
+                f.write(f"  Failed extractions: {stats['failed']}\n")
+                f.write(f"  Success rate: {stats['successful'] / stats['total_processed'] * 100:.1f}%\n\n")
+                
+                # Category-wise analysis
+                for category, features_list in features_data.items():
+                    f.write(f"Category: {category.upper()}\n")
+                    f.write("-" * 30 + "\n")
+                    
+                    if not features_list:
+                        f.write("  No features extracted\n\n")
+                        continue
+                    
+                    successful_features = [f for f in features_list if f.processing_success]
+                    
+                    if not successful_features:
+                        f.write("  No successful feature extractions\n\n")
+                        continue
+                    
+                    # Calculate category statistics
+                    word_counts = [f.word_count for f in successful_features]
+                    lexical_diversity = [f.lexical_diversity for f in successful_features]
+                    complexity = [f.complex_words_ratio for f in successful_features]
+                    disfluency = [f.disfluency_ratio for f in successful_features]
+                    readability = [f.flesch_reading_ease for f in successful_features]
+                    
+                    f.write(f"  Files: {len(successful_features)}\n")
+                    f.write(f"  Average word count: {np.mean(word_counts):.1f} (±{np.std(word_counts):.1f})\n")
+                    f.write(f"  Average lexical diversity: {np.mean(lexical_diversity):.3f}\n")
+                    f.write(f"  Average complexity: {np.mean(complexity):.3f}\n")
+                    f.write(f"  Average disfluency: {np.mean(disfluency):.3f}\n")
+                    f.write(f"  Average readability: {np.mean(readability):.1f}\n")
+                    
+                    # BERT statistics
+                    bert_available = sum(1 for f in successful_features if f.bert_cls_embedding is not None)
+                    f.write(f"  BERT embeddings available: {bert_available}/{len(successful_features)}\n")
+                    
+                    f.write("\n")
+                
+                f.write("\nFiles saved:\n")
+                f.write("  - linguistic_features.pkl (complete features)\n")
+                f.write("  - linguistic_features.json (features without embeddings)\n")
+                f.write("  - bert_embeddings/ (BERT embeddings by category)\n")
+                f.write("  - feature_analysis.csv (detailed analysis)\n")
+            
+            self.logger.info(f"✓ Feature summary saved to {summary_file}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving feature summary: {e}")
+
+    def _save_feature_analysis(self, features_data: Dict[str, List[LinguisticFeatures]], output_dir: str):
+        """Save detailed feature analysis as CSV"""
+        try:
+            import csv
+            
+            analysis_file = os.path.join(output_dir, "feature_analysis.csv")
+            
+            # Define columns
+            columns = [
+                'filename', 'category', 'processing_success', 'word_count', 'sentence_count',
+                'lexical_diversity', 'function_words_ratio', 'content_words_ratio',
+                'vocab_sophistication', 'avg_syllables_per_word', 'complex_words_ratio',
+                'flesch_reading_ease', 'flesch_kincaid_grade', 'repetition_ratio',
+                'disfluency_ratio', 'pause_indicators', 'filler_words',
+                'bert_available', 'bert_token_count', 'bert_oov_count',
+                'processing_time'
+            ]
+            
+            with open(analysis_file, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(columns)
+                
+                for category, features_list in features_data.items():
+                    for features in features_list:
+                        row = [
+                            features.source_file,
+                            features.category,
+                            features.processing_success,
+                            features.word_count,
+                            features.sentence_count,
+                            round(features.lexical_diversity, 4),
+                            round(features.function_words_ratio, 4),
+                            round(features.content_words_ratio, 4),
+                            round(features.vocab_sophistication, 4),
+                            round(features.avg_syllables_per_word, 3),
+                            round(features.complex_words_ratio, 4),
+                            round(features.flesch_reading_ease, 2),
+                            round(features.flesch_kincaid_grade, 2),
+                            round(features.repetition_ratio, 4),
+                            round(features.disfluency_ratio, 4),
+                            features.pause_indicators,
+                            features.filler_words,
+                            features.bert_cls_embedding is not None,
+                            features.bert_token_count,
+                            features.bert_oov_count,
+                            round(features.processing_time, 3)
+                        ]
+                        writer.writerow(row)
+            
+            self.logger.info(f"✓ Feature analysis saved to {analysis_file}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving feature analysis: {e}")
+
+    def batch_process_texts(self, texts: List[str], batch_size: int = 32) -> List[LinguisticFeatures]:
+        """Process multiple texts in batches with enhanced memory management"""
+        try:
+            self.logger.info(f"Processing {len(texts)} texts in batches of {batch_size}")
+            results = []
+
+            with ProcessingTimer() as timer:
+                for i, batch in enumerate(batch_generator(texts, batch_size)):
+                    self.logger.info(f"Processing batch {i+1}/{(len(texts) + batch_size - 1) // batch_size}")
+                    
+                    batch_results = []
+                    for j, text in enumerate(batch):
+                        features = self.extract_features(
+                            text=text,
+                            source_file=f"batch_{i+1}_item_{j+1}",
+                            category="batch_processing"
+                        )
+                        batch_results.append(features)
+                    
+                    results.extend(batch_results)
+                    
+                    # Memory cleanup between batches
+                    cleanup_memory()
+                    
+                    if (i + 1) % 5 == 0:  # Log progress every 5 batches
+                        self.logger.info(f"Completed {i+1} batches, {len(results)} texts processed")
+
+            self.logger.info(f"✓ Batch processing completed in {timer.elapsed:.2f}s")
+            return results
+
+        except Exception as e:
+            self.logger.error(f"Error in batch processing: {e}")
+            return [self._create_empty_features(text, str(e)) for text in texts]
+
+    def get_feature_comparison(self, features_data: Dict[str, List[LinguisticFeatures]]) -> Dict[str, Any]:
+        """Get comparative analysis between categories"""
+        try:
+            comparison = {}
+            
+            for category, features_list in features_data.items():
+                successful_features = [f for f in features_list if f.processing_success]
+                
+                if not successful_features:
+                    comparison[category] = {"error": "No successful features"}
+                    continue
+                
+                # Calculate statistics
+                metrics = {
+                    'word_count': [f.word_count for f in successful_features],
+                    'lexical_diversity': [f.lexical_diversity for f in successful_features],
+                    'vocab_sophistication': [f.vocab_sophistication for f in successful_features],
+                    'complex_words_ratio': [f.complex_words_ratio for f in successful_features],
+                    'disfluency_ratio': [f.disfluency_ratio for f in successful_features],
+                    'flesch_reading_ease': [f.flesch_reading_ease for f in successful_features],
+                    'function_words_ratio': [f.function_words_ratio for f in successful_features]
+                }
+                
+                category_stats = {}
+                for metric, values in metrics.items():
+                    category_stats[metric] = {
+                        'mean': float(np.mean(values)),
+                        'std': float(np.std(values)),
+                        'min': float(np.min(values)),
+                        'max': float(np.max(values)),
+                        'median': float(np.median(values))
+                    }
+                
+                comparison[category] = {
+                    'n_samples': len(successful_features),
+                    'bert_available': sum(1 for f in successful_features if f.bert_cls_embedding is not None),
+                    'metrics': category_stats
+                }
+            
+            return comparison
+            
+        except Exception as e:
+            self.logger.error(f"Error in feature comparison: {e}")
+            return {'error': str(e)}
+
+    def cleanup(self):
+        """Enhanced cleanup with better memory management"""
+        try:
+            if self.bert_model:
+                del self.bert_model
+            if self.bert_tokenizer:
+                del self.bert_tokenizer
+            
+            cleanup_memory()
+            
+            # Additional GPU cleanup if available
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            
+            self.logger.info("✓ Enhanced linguistic features service cleanup completed")
+            
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {e}")
+
+# Factory functions
+def create_linguistic_features_service(bert_model: str = "bert-base-uncased",
+                                     max_length: int = 512,
+                                     device: str = "auto",
+                                     logger: Optional[logging.Logger] = None) -> EnhancedLinguisticFeaturesService:
+    """Factory function to create an enhanced LinguisticFeaturesService instance"""
+    return EnhancedLinguisticFeaturesService(
+        bert_model=bert_model,
+        max_length=max_length,
+        device=device,
+        logger=logger
+    )
+
+# Main execution for testing
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Extract linguistic features from transcription results")
+    parser.add_argument("--results_file", required=True, help="Path to transcription results JSON file")
+    parser.add_argument("--output_dir", help="Output directory (default: same as results file)")
+    parser.add_argument("--bert_model", default="bert-base-uncased", help="BERT model to use")
+    parser.add_argument("--max_length", type=int, default=512, help="Maximum sequence length")
+    parser.add_argument("--device", default="auto", help="Device to use (auto, cpu, cuda)")
+    
+    args = parser.parse_args()
+    
+    # Create service
+    logger = setup_logging()
+    service = create_linguistic_features_service(
+        bert_model=args.bert_model,
+        max_length=args.max_length,
+        device=args.device,
+        logger=logger
+    )
+    
+    try:
+        # Process transcription results
+        logger.info("Starting linguistic feature extraction...")
+        results = service.process_transcription_files(args.results_file, args.output_dir)
+        
+        if 'error' in results:
+            logger.error(f"Processing failed: {results['error']}")
+        else:
+            # Print summary
+            stats = results['stats']
+            logger.info(f"\n=== PROCESSING COMPLETE ===")
+            logger.info(f"Total files processed: {stats['total_processed']}")
+            logger.info(f"Successful extractions: {stats['successful']}")
+            logger.info(f"Failed extractions: {stats['failed']}")
+            logger.info(f"Success rate: {stats['successful'] / stats['total_processed'] * 100:.1f}%")
+            logger.info(f"Output saved to: {results['output_dir']}/linguistic_features/")
+            
+            # Get feature comparison
+            comparison = service.get_feature_comparison(results['features'])
+            logger.info("\n=== CATEGORY COMPARISON ===")
+            for category, stats in comparison.items():
+                if 'error' not in stats:
+                    logger.info(f"{category}: {stats['n_samples']} samples, "
+                              f"avg complexity: {stats['metrics']['complex_words_ratio']['mean']:.3f}")
+    
+    finally:
+        service.cleanup()
+        logger.info("✓ Processing completed")
+        
+        
+        
+output:
+python .\linguistic_features_service.py
+✓ Transformers library available
+usage: linguistic_features_service.py [-h] --results_file RESULTS_FILE [--output_dir OUTPUT_DIR] [--bert_model BERT_MODEL]
+                                      [--max_length MAX_LENGTH] [--device DEVICE]
+linguistic_features_service.py: error: the following arguments are required: --results_file
